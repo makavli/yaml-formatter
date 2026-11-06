@@ -1,214 +1,179 @@
-from flask import Flask, jsonify, request, send_from_directory
-from flask_cors import CORS
-import yaml
 import os
-from io import StringIO
+from pathlib import Path
 
-app = Flask(__name__, static_folder='static', static_url_path='/')
-CORS(app)
+import yaml
+from flask import Flask, jsonify, request, send_from_directory
 
-class CustomYAMLLoader(yaml.SafeLoader):
-    pass
+HERE = Path(__file__).resolve().parent
+# In the Docker image the frontend is copied to ./static next to app.py;
+# when running from a checkout it lives in ../frontend.
+STATIC_DIR = HERE / "static" if (HERE / "static").is_dir() else HERE.parent / "frontend"
+
+app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/")
+app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_CONTENT_LENGTH", 2 * 1024 * 1024))
+
+
+class DuplicateKeyLoader(yaml.SafeLoader):
+    """SafeLoader that records duplicate mapping keys instead of silently
+    keeping the last one (which is what PyYAML normally does)."""
+
+    def __init__(self, stream):
+        super().__init__(stream)
+        self.duplicates = []
+
+    def construct_mapping(self, node, deep=False):
+        seen = {}
+        for key_node, _ in node.value:
+            if key_node.tag == "tag:yaml.org,2002:merge":
+                continue
+            key = self.construct_object(key_node, deep=True)
+            try:
+                first_line = seen.get(key)
+            except TypeError:  # unhashable key (e.g. a list); PyYAML reports this itself
+                continue
+            line = key_node.start_mark.line + 1
+            if first_line is not None:
+                self.duplicates.append((key, line, first_line))
+            else:
+                seen[key] = line
+        return super().construct_mapping(node, deep)
+
 
 class CustomYAMLDumper(yaml.SafeDumper):
     pass
 
-def customize_dumper(dumper):
-    def represent_none(dumper, _):
-        return dumper.represent_scalar('tag:yaml.org,2002:null', '')
-    
-    dumper.add_representer(type(None), represent_none)
 
-customize_dumper(CustomYAMLDumper)
+def _represent_none(dumper, _):
+    return dumper.represent_scalar("tag:yaml.org,2002:null", "")
 
-@app.route('/')
-def serve_index():
-    return send_from_directory('static', 'index.html')
 
-@app.route('/<path:path>')
-def serve_static(path):
-    if path and os.path.exists(os.path.join('static', path)):
-        return send_from_directory('static', path)
-    return send_from_directory('static', 'index.html')
+CustomYAMLDumper.add_representer(type(None), _represent_none)
 
-@app.route('/api/validate', methods=['POST'])
-def validate_yaml():
-    """Validate and format YAML content"""
-    data = request.json
-    yaml_content = data.get('content', '').strip()
-    filename = data.get('filename', 'untitled.yaml')
-    
-    if not yaml_content:
-        return jsonify({
-            'valid': False,
-            'error': 'Empty YAML content',
-            'filename': filename,
-            'formatted': ''
-        }), 400
-    
+
+def parse_documents(text):
+    """Parse every document in a (possibly multi-document) YAML stream.
+    Returns (documents, duplicate_keys)."""
+    loader = DuplicateKeyLoader(text)
     try:
-        # Parse YAML to validate
-        parsed = yaml.load(yaml_content, Loader=CustomYAMLLoader)
-        
-        # Format YAML with proper indentation
-        formatted = yaml.dump(
-            parsed,
-            Dumper=CustomYAMLDumper,
-            default_flow_style=False,
-            sort_keys=False,
-            allow_unicode=True,
-            width=120
-        ).strip()
-        
-        # Get line count
-        lines = len(formatted.split('\n'))
-        
-        return jsonify({
-            'valid': True,
-            'filename': filename,
-            'formatted': formatted,
-            'lines': lines,
-            'error': None,
-            'warnings': get_yaml_warnings(yaml_content, parsed)
-        }), 200
-        
+        documents = []
+        while loader.check_data():
+            documents.append(loader.get_data())
+        return documents, loader.duplicates
+    finally:
+        loader.dispose()
+
+
+def format_documents(documents):
+    options = dict(Dumper=CustomYAMLDumper, default_flow_style=False, sort_keys=False,
+                   allow_unicode=True, width=120)
+    if len(documents) <= 1:
+        return yaml.dump(documents[0] if documents else None, **options).strip()
+    return yaml.dump_all(documents, explicit_start=True, **options).strip()
+
+
+def process(content, filename):
+    """Validate and format one file. Always returns the same response shape."""
+    content = content.strip()
+    result = {"filename": filename, "valid": False, "formatted": "", "error": None, "warnings": []}
+    if not content:
+        result["error"] = "Empty YAML content"
+        return result
+    try:
+        documents, duplicates = parse_documents(content)
+        formatted = format_documents(documents)
     except yaml.YAMLError as e:
-        # Parse error details
-        error_msg = str(e)
-        line_num = None
-        col_num = None
-        
-        if hasattr(e, 'problem_mark'):
-            mark = e.problem_mark
-            line_num = mark.line + 1
-            col_num = mark.column + 1
-            error_msg = f"Line {line_num}, Column {col_num}: {e.problem}"
-        
-        return jsonify({
-            'valid': False,
-            'filename': filename,
-            'formatted': '',
-            'error': error_msg,
-            'line': line_num,
-            'column': col_num,
-            'warnings': []
-        }), 200
-    
-    except Exception as e:
-        return jsonify({
-            'valid': False,
-            'filename': filename,
-            'formatted': '',
-            'error': f'Unexpected error: {str(e)}',
-            'warnings': []
-        }), 200
+        mark = getattr(e, "problem_mark", None)
+        if mark is not None:
+            result["line"], result["column"] = mark.line + 1, mark.column + 1
+            result["error"] = f"Line {mark.line + 1}, Column {mark.column + 1}: {getattr(e, 'problem', e)}"
+        else:
+            result["error"] = str(e)
+        return result
+    result.update(valid=True, formatted=formatted, lines=len(formatted.splitlines()),
+                  documents=len(documents), warnings=get_yaml_warnings(content, duplicates))
+    return result
 
-@app.route('/api/batch-validate', methods=['POST'])
-def batch_validate():
-    """Validate multiple YAML files"""
-    data = request.json
-    files = data.get('files', [])
-    
-    results = []
-    for file_data in files:
-        yaml_content = file_data.get('content', '').strip()
-        filename = file_data.get('filename', 'untitled.yaml')
-        
-        try:
-            parsed = yaml.load(yaml_content, Loader=CustomYAMLLoader)
-            formatted = yaml.dump(
-                parsed,
-                Dumper=CustomYAMLDumper,
-                default_flow_style=False,
-                sort_keys=False,
-                allow_unicode=True,
-                width=120
-            ).strip()
-            
-            results.append({
-                'filename': filename,
-                'valid': True,
-                'formatted': formatted,
-                'lines': len(formatted.split('\n')),
-                'error': None,
-                'warnings': get_yaml_warnings(yaml_content, parsed)
-            })
-        except yaml.YAMLError as e:
-            error_msg = str(e)
-            line_num = None
-            
-            if hasattr(e, 'problem_mark'):
-                mark = e.problem_mark
-                line_num = mark.line + 1
-                error_msg = f"Line {line_num}: {e.problem}"
-            
-            results.append({
-                'filename': filename,
-                'valid': False,
-                'formatted': '',
-                'error': error_msg,
-                'line': line_num,
-                'warnings': []
-            })
-        except Exception as e:
-            results.append({
-                'filename': filename,
-                'valid': False,
-                'formatted': '',
-                'error': f'Error: {str(e)}',
-                'warnings': []
-            })
-    
-    return jsonify({'results': results}), 200
 
-def get_yaml_warnings(content, parsed):
-    """Check for common YAML issues"""
+def get_yaml_warnings(content, duplicates=()):
+    """Check for common YAML issues."""
     warnings = []
-    
-    # Check for tabs
-    if '\t' in content:
-        tab_lines = [i + 1 for i, line in enumerate(content.split('\n')) if '\t' in line]
+    lines = content.split("\n")
+
+    tab_lines = [i + 1 for i, line in enumerate(lines) if "\t" in line]
+    if tab_lines:
+        more = " ..." if len(tab_lines) > 5 else ""
         warnings.append({
-            'type': 'tab-found',
-            'message': f'Tabs found on lines: {", ".join(map(str, tab_lines[:5]))}{" ..." if len(tab_lines) > 5 else ""}. Tabs should be replaced with spaces.',
-            'severity': 'warning'
+            "type": "tab-found",
+            "message": f"Tabs found on lines: {', '.join(map(str, tab_lines[:5]))}{more}. "
+                       "Tabs should be replaced with spaces.",
+            "severity": "warning",
         })
-    
-    # Check for mixed indentation
-    lines = content.split('\n')
-    indent_chars = set()
-    for line in lines:
-        if line and line[0] in (' ', '\t'):
-            indent_chars.add(line[0])
-    
+
+    indent_chars = {line[0] for line in lines if line and line[0] in (" ", "\t")}
     if len(indent_chars) > 1:
         warnings.append({
-            'type': 'mixed-indent',
-            'message': 'Mixed indentation detected (spaces and tabs). Use only spaces.',
-            'severity': 'warning'
+            "type": "mixed-indent",
+            "message": "Mixed indentation detected (spaces and tabs). Use only spaces.",
+            "severity": "warning",
         })
-    
-    # Check for duplicate keys
-    if isinstance(parsed, dict):
-        warnings.extend(check_duplicate_keys(parsed, 'root'))
-    
+
+    for key, line, first_line in duplicates:
+        warnings.append({
+            "type": "duplicate-key",
+            "message": f"Duplicate key '{key}' on line {line} (first defined on line {first_line}). "
+                       "Only the last value is kept.",
+            "severity": "warning",
+        })
     return warnings
 
-def check_duplicate_keys(obj, path=''):
-    """Recursively check for duplicate keys"""
-    warnings = []
-    
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            new_path = f"{path}.{key}" if path else key
-            if isinstance(value, dict):
-                warnings.extend(check_duplicate_keys(value, new_path))
-    
-    return warnings
 
-@app.route('/health', methods=['GET'])
+def _json_body():
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else None
+
+
+@app.route("/")
+def serve_index():
+    return send_from_directory(app.static_folder, "index.html")
+
+
+@app.route("/<path:path>")
+def serve_static(path):
+    if (STATIC_DIR / path).is_file():
+        return send_from_directory(app.static_folder, path)
+    return send_from_directory(app.static_folder, "index.html")
+
+
+@app.route("/api/validate", methods=["POST"])
+def validate_yaml():
+    """Validate and format YAML content."""
+    data = _json_body()
+    if data is None:
+        return jsonify({"valid": False, "error": "Request body must be a JSON object"}), 400
+    result = process(str(data.get("content", "")), str(data.get("filename", "untitled.yaml")))
+    status = 400 if result["error"] == "Empty YAML content" else 200
+    return jsonify(result), status
+
+
+@app.route("/api/batch-validate", methods=["POST"])
+def batch_validate():
+    """Validate multiple YAML files."""
+    data = _json_body()
+    files = data.get("files") if data else None
+    if not isinstance(files, list):
+        return jsonify({"error": "Request body must be a JSON object with a 'files' list"}), 400
+    results = [process(str(f.get("content", "")), str(f.get("filename", "untitled.yaml")))
+               for f in files if isinstance(f, dict)]
+    return jsonify({"results": results}), 200
+
+
+@app.route("/health", methods=["GET"])
 def health():
-    return jsonify({'status': 'healthy'}), 200
+    return jsonify({"status": "healthy"}), 200
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5001, debug=True)
+
+if __name__ == "__main__":
+    # Development server only. The Docker image runs gunicorn instead.
+    # Never enable debug mode on a reachable host: the Werkzeug debugger allows code execution.
+    debug = os.environ.get("FLASK_DEBUG", "0") == "1"
+    app.run(host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", 5001)), debug=debug)

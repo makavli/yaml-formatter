@@ -1,21 +1,24 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application files
 COPY backend/app.py .
 COPY frontend ./static
 
-# Expose port
+# Run as an unprivileged user
+RUN useradd --create-home --uid 10001 appuser
+USER appuser
+
 EXPOSE 5001
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5001/health')"
 
-# Run the application
-CMD ["python", "app.py"]
+# Production WSGI server (the Flask dev server and its debugger are never used here)
+CMD ["gunicorn", "--bind", "0.0.0.0:5001", "--workers", "2", "--access-logfile", "-", "app:app"]

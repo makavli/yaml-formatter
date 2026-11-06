@@ -1,19 +1,17 @@
-version: '3.8'
-
 services:
   yaml-formatter:
     build: .
     container_name: yaml-formatter-app
     ports:
-      - "5001:5001"
-    volumes:
-      - ./data:/app/data
-    environment:
-      - FLASK_ENV=production
+      # Only reachable from this machine. Change to "5001:5001" to expose it on your network.
+      - "127.0.0.1:5001:5001"
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5001/health')"]
       interval: 30s
-      timeout: 10s
+      timeout: 5s
       retries: 3
       start_period: 5s
