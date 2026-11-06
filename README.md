@@ -26,7 +26,7 @@ A containerized web application for validating and formatting YAML files. Perfec
 
 ```bash
 cd yaml-formatter
-docker-compose up -d
+docker compose up -d
 # Open http://localhost:5001
 ```
 
@@ -36,8 +36,11 @@ docker-compose up -d
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
-python backend/app.py
-# Open http://localhost:5001
+python backend/app.py          # dev server on http://127.0.0.1:5001 (debugger off)
+# FLASK_DEBUG=1 python backend/app.py   # only on your own machine, never on a server
+
+# Run the tests
+python -m unittest discover -s tests -v
 ```
 
 ## Usage
@@ -97,14 +100,15 @@ python backend/app.py
 
 ### Formatting
 - Normalizes indentation (2 spaces, configurable)
-- Sorts keys consistently
+- Keeps your keys in their original order
 - Handles Unicode properly
 - Respects YAML structure
 
 ### Warnings
 - **Tab Detection** - Alerts when tabs are used instead of spaces
 - **Mixed Indentation** - Detects inconsistent spacing
-- **Structure Issues** - Warns about potential YAML problems
+- **Duplicate Keys** - Flags keys defined twice in the same mapping (YAML silently keeps only the last one)
+- **Multi-document files** - Files with several `---` documents (e.g. Kubernetes manifests) are validated and formatted document by document
 
 ## Example Conversions
 
@@ -144,7 +148,10 @@ yaml-formatter/
 ├── frontend/
 │   └── index.html          # Web interface with drag-and-drop
 ├── Dockerfile              # Container build definition
-├── docker-compose.yml      # Multi-container orchestration
+├── docker-compose.yml      # Compose service (bound to localhost by default)
+├── tests/
+│   └── test_app.py         # API tests (python -m unittest)
+├── .github/workflows/ci.yml  # Tests + container smoke test
 ├── requirements.txt        # Python dependencies
 ├── .dockerignore            # Files excluded from build
 ├── .gitignore               # Git ignore patterns
@@ -177,7 +184,7 @@ ports:
 ### Container won't start
 Check logs:
 ```bash
-docker-compose logs -f yaml-formatter
+docker compose logs -f yaml-formatter
 ```
 
 ### YAML not formatting correctly
@@ -188,7 +195,13 @@ Some YAML anchors, aliases, and custom tags may not be preserved. This is a limi
 - Custom YAML tags are not preserved
 - Anchors and aliases are resolved
 - Comments in YAML are not preserved during formatting
-- Very large files (>10MB) may timeout
+- Request size is capped at 2 MB (set `MAX_CONTENT_LENGTH` to change it)
+
+## Security notes
+
+- The container runs **gunicorn** as a non-root user; Flask's debug server is never used in Docker.
+- Compose publishes the port on `127.0.0.1` only. To share it on your network, change it to `"5001:5001"` and put it behind authentication.
+- YAML is parsed with PyYAML's `SafeLoader`, so tags like `!!python/object` are rejected rather than executed.
 
 ## Performance
 
